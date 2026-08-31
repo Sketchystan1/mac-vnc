@@ -1,0 +1,218 @@
+name: macOS VNC
+
+on:
+  workflow_dispatch:
+    inputs:
+      ARCH:
+        description: 'Architecture'
+        type: choice
+        options:
+          - arm64
+          - x64
+        default: arm64
+      MAC_PASSWORD:
+        description: 'Password (required if not set in Secrets, max 8 chars)'
+        required: false
+
+jobs:
+  macos:
+    # macos-13 is the last Intel runner image GitHub offers; it is being
+    # phased out. When it is retired, x64 will fail to queue.
+    runs-on: ${{ inputs.ARCH == 'x64' && 'macos-13' || 'macos-latest' }}
+    timeout-minutes: 360
+    # A new dispatch of the same arch cancels the previous run so old sessions
+    # don't silently burn the full 6h timeout in the background.
+    concurrency:
+      group: ${{ github.workflow }}-${{ inputs.ARCH }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Start macOS ${{ inputs.ARCH }}
+        env:
+          MAC_PASSWORD: ${{ secrets.MAC_PASSWORD || inputs.MAC_PASSWORD }}
+        run: |
+          if [ -z "$MAC_PASSWORD" ]; then
+            echo "::error::Password is required. Set it in Settings > Secrets or in the workflow input."
+            exit 1
+          fi
+
+          echo "::add-mask::$MAC_PASSWORD"
+
+          if [ ${#MAC_PASSWORD} -gt 8 ]; then
+            echo "::warning::Only the first 8 characters of the password are used."
+          fi
+
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install cloudflared
+          git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/noVNC
+
+          CONSOLE_USER=$(stat -f %Su /dev/console 2>/dev/null || true)
+          if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
+            echo "::error::No active GUI console session found. Cannot provide a desktop."
+            exit 1
+          fi
+          GUI_UID=$(id -u "$CONSOLE_USER")
+
+          if [ "$CONSOLE_USER" != "admin" ]; then
+            sudo dscl . -change "/Users/$CONSOLE_USER" RecordName "$CONSOLE_USER" admin 2>/dev/null || true
+            CONSOLE_USER=admin
+          fi
+          export USER="$CONSOLE_USER" LOGNAME="$CONSOLE_USER"
+
+          sudo sysadminctl -resetPasswordFor "$CONSOLE_USER" -newPassword "$MAC_PASSWORD" 2>/dev/null \
+            || sudo dscl . -passwd "/Users/$CONSOLE_USER" "$MAC_PASSWORD" 2>/dev/null || true
+          sudo dseditgroup -o edit -a "$CONSOLE_USER" -t user admin 2>/dev/null || true
+
+          sudo systemsetup -setsleep Never 2>/dev/null || true
+          sudo systemsetup -setdisplaysleep Never 2>/dev/null || true
+          sudo pmset -a sleep 0 displaysleep 0 disksleep 0 powernap 0 2>/dev/null || true
+          caffeinate -dimsu > caffeinate.log 2>&1 &
+
+          # No screensaver - otherwise the session locks behind us mid-run.
+          # sudo -H so `defaults` gets the target user's HOME for the ByHost plist.
+          sudo -H -u "$CONSOLE_USER" defaults -currentHost write com.apple.screensaver idleTime 0 2>/dev/null || true
+          sudo defaults write com.apple.universalaccess reduceTransparency -bool true
+          sudo defaults write com.apple.universalaccess reduceMotion -bool true
+
+          sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCLegacyConnectionsAllowed -bool true
+          sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCAlwaysStartOnConsole -bool true
+
+          TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
+          if [ -f "$TCC_DB" ]; then
+            for SERVICE in kTCCServiceScreenCapture kTCCServiceAccessibility kTCCServicePostEvent; do
+              sudo sqlite3 "$TCC_DB" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, csreq, policy_id, indirect_object_identifier_type, indirect_object_identifier, indirect_object_code_identity, flags, last_modified) VALUES ('$SERVICE', 'com.apple.screensharing.agent', 0, 2, 4, 1, NULL, NULL, 0, 'UNUSED', NULL, 0, strftime('%s','now'));" 2>/dev/null || true
+              sudo sqlite3 "$TCC_DB" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, csreq, policy_id, indirect_object_identifier_type, indirect_object_identifier, indirect_object_code_identity, flags, last_modified) VALUES ('$SERVICE', 'com.apple.RemoteManagement', 0, 2, 4, 1, NULL, NULL, 0, 'UNUSED', NULL, 0, strftime('%s','now'));" 2>/dev/null || true
+            done
+            sudo killall tccd 2>/dev/null || true
+          fi
+
+          KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+          sudo "$KICKSTART" -deactivate -stop 2>/dev/null || true
+          sleep 2
+          sudo "$KICKSTART" \
+            -activate -configure -access -on -restart -agent -privs -all -allowAccessFor -allUsers \
+            -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$MAC_PASSWORD"
+          sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
+
+          PORT_OK=false
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 5900 2>/dev/null; then
+              PORT_OK=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$PORT_OK" != "true" ]; then
+            echo "::error::Server (port 5900) did not start."
+            exit 1
+          fi
+
+          sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" open -a Finder 2>/dev/null || true
+          sleep 3
+
+          perl -0pi -e 's/return clientTypes\.includes\(type\);/return type === securityTypeVNCAuth;/' /tmp/noVNC/core/rfb.js
+          if ! grep -q "return type === securityTypeVNCAuth" /tmp/noVNC/core/rfb.js; then
+            echo "::warning::Client patch failed."
+          fi
+          /tmp/noVNC/utils/novnc_proxy --vnc localhost:5900 --listen 6080 > novnc.log 2>&1 &
+          sleep 3
+
+          # Two tunnels: HTTPS for browser access (noVNC), TCP for native VNC clients
+          cloudflared tunnel --url http://localhost:6080 --no-autoupdate > cloudflared.log 2>&1 &
+          cloudflared tunnel --url tcp://localhost:5900 --no-autoupdate > cloudflared-tcp.log 2>&1 &
+
+          wait_for_tunnel_url() {
+            local LOGFILE="$1" URL
+            for i in {1..30}; do
+              URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' "$LOGFILE" | tail -n 1) || true
+              if [ -n "$URL" ]; then
+                printf '%s\n' "$URL"
+                return 0
+              fi
+              sleep 1
+            done
+            return 1
+          }
+
+          TUNNEL_URL=$(wait_for_tunnel_url cloudflared.log) || true
+          TCP_TUNNEL_URL=$(wait_for_tunnel_url cloudflared-tcp.log) || true
+
+          if [ -z "$TUNNEL_URL" ] || [ -z "$TCP_TUNNEL_URL" ]; then
+            echo "::error::Failed to start Cloudflare tunnel(s)!"
+            cat cloudflared.log cloudflared-tcp.log
+            exit 1
+          fi
+
+          SESSION_URL="${TUNNEL_URL}/vnc.html?autoconnect=true&resize=remote"
+
+          echo "🌐 Browser: $SESSION_URL"
+          echo "🔌 Native VNC: run 'cloudflared access tcp --hostname $TCP_TUNNEL_URL --url localhost:5900' locally, then connect your VNC client to localhost:5900"
+
+          {
+            echo "### macOS ${{ inputs.ARCH }}"
+            echo "- 🌐 [Open Desktop (browser)](${SESSION_URL})"
+            echo "- 🔌 **Native VNC client:** run \`cloudflared access tcp --hostname ${TCP_TUNNEL_URL} --url localhost:5900\` locally, then connect your VNC client to \`localhost:5900\`"
+            echo "- 👤 **Username:** \`$CONSOLE_USER\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          end=$((SECONDS + 21600))
+          TUNNEL_FAILURES=0
+          while [ $SECONDS -lt $end ]; do
+            if ! nc -z 127.0.0.1 5900 2>/dev/null; then
+              echo "⚠️ 5900 down - restarting screensharing..."
+              sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
+              sleep 4
+            fi
+            if ! nc -z 127.0.0.1 6080 2>/dev/null; then
+              echo "⚠️ 6080 down - restarting noVNC..."
+              pkill -f novnc_proxy 2>/dev/null || true
+              /tmp/noVNC/utils/novnc_proxy --vnc localhost:5900 --listen 6080 >> novnc.log 2>&1 &
+            fi
+
+            # Browser tunnel: probe it end-to-end; restart cloudflared after 2 consecutive failures
+            if curl -sf -m 15 "${TUNNEL_URL}/vnc.html" > /dev/null 2>&1; then
+              TUNNEL_FAILURES=0
+            else
+              TUNNEL_FAILURES=$((TUNNEL_FAILURES + 1))
+              echo "⚠️ browser tunnel unreachable ($TUNNEL_FAILURES/2)"
+              if [ "$TUNNEL_FAILURES" -ge 2 ]; then
+                echo "⚠️ restarting HTTP tunnel..."
+                pkill -f "cloudflared tunnel --url http://localhost:6080" 2>/dev/null || true
+                sleep 2
+                cloudflared tunnel --url http://localhost:6080 --no-autoupdate >> cloudflared.log 2>&1 &
+                TUNNEL_URL=$(wait_for_tunnel_url cloudflared.log) || true
+                if [ -n "$TUNNEL_URL" ]; then
+                  SESSION_URL="${TUNNEL_URL}/vnc.html?autoconnect=true&resize=remote"
+                  echo "🌐 New browser URL: $SESSION_URL"
+                  echo "- 🌐 [Open Desktop (browser) - tunnel restarted](${SESSION_URL})" >> "$GITHUB_STEP_SUMMARY"
+                else
+                  echo "::warning::HTTP tunnel restart did not produce a URL."
+                fi
+                TUNNEL_FAILURES=0
+              fi
+            fi
+
+            # Native client tunnel: just needs a live process
+            if ! pgrep -f "cloudflared tunnel --url tcp://localhost:5900" > /dev/null 2>&1; then
+              echo "⚠️ TCP tunnel down - restarting..."
+              cloudflared tunnel --url tcp://localhost:5900 --no-autoupdate >> cloudflared-tcp.log 2>&1 &
+              TCP_TUNNEL_URL=$(wait_for_tunnel_url cloudflared-tcp.log) || true
+              if [ -n "$TCP_TUNNEL_URL" ]; then
+                echo "🔌 New native VNC host: $TCP_TUNNEL_URL"
+                echo "- 🔌 **Native VNC (tunnel restarted):** \`cloudflared access tcp --hostname ${TCP_TUNNEL_URL} --url localhost:5900\`" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            fi
+
+            echo "✓ alive - $(date '+%H:%M:%S')"
+            sleep 300
+          done
+
+      - name: Upload logs
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ inputs.ARCH }}
+          path: |
+            cloudflared.log
+            cloudflared-tcp.log
+            novnc.log
+            caffeinate.log
+          if-no-files-found: ignore
